@@ -1,0 +1,339 @@
+#include <Wire.h>
+#include <math.h>
+
+//==== Pinek megadása ====
+
+#define PWM_Pin 6
+#define DIR_Pin 7
+#define Hall_Pin_A 2
+#define Hall_Pin_B 3
+
+//==== Változók deklarálása ====
+
+//Szenzorokhoz:
+unsigned long time_old;
+long dick;
+
+int gyro1 = 0;
+int acc1X, acc1Y, acc1Z;
+
+int gyro2 = 0;
+int acc2X, acc2Y, acc2Z;
+
+long gyro1_cal_sum = 0;
+long gyro2_cal_sum = 0;
+
+float gyro1_cal;
+float gyro2_cal;
+
+long acc1Y_cal_sum = 0;
+long acc2Y_cal_sum = 0;
+
+float acc1Y_cal;
+float acc2Y_cal;
+
+float rot1;
+float D_angle1 = 0;
+float angle1,angle1g,angle1a = 0;
+
+float rot2;
+float D_angle2 = 0;
+float angle2,angle2g,angle2a = 0;
+
+float gyro_filter = 0.98;
+float acc_filter = 1-gyro_filter; 
+
+//Motorvezérléshez:
+volatile int PWM = 0;
+volatile int DIR = 1;
+
+//Motor encoder-hez:
+volatile int Ticks = 0;
+volatile double motor_speed = 0;  
+volatile double motor_speed_prev = 0;
+volatile double motor_acc = 0;
+
+//== Szabályozáshoz ==
+volatile float M;
+
+
+//== Számlálók az időhöz kötött számításokhoz (10ms -okat számlálnak) ==
+volatile byte Counter_Measure = 0;
+volatile byte Counter_Tau = 0;
+
+volatile byte Tau = 4; // *10 ms
+
+volatile float angle1_cal = 0;
+float angle1_cal_cal = 0;
+volatile int i = 0;
+
+//=================================================================================
+//=================================================================================
+
+//==== Setup ====
+void setup() {  
+  pinMode(DIR_Pin,OUTPUT);
+  pinMode(PWM_Pin,OUTPUT);
+  
+  Serial.begin(9600); 
+
+  Wire.begin();
+  Wire.setClock(400000L);
+  setupMPU1();
+//  setupMPU2();
+  Calibrate_MPU1();
+  angle1 = -atan2(acc1Y - acc1Y_cal, acc1X) * 57.2958;
+//  Calibrate_MPU2();  
+  
+  noInterrupts();           // disable all interrupts  
+//set timer1 
+  TCCR1A = 0; // set entire TCCR1A register to 0
+  TCCR1B = 0; // same for TCCR1B
+  TCNT1  = 0; //initialize counter value to 0
+  OCR1A = 2499; // set compare match register for 10 ms
+  TCCR1B |= (1 << WGM12); // turn on CTC mode  
+  TCCR1B |= (1 << CS11) | (1 << CS10); // Set CS12 bit for 64 prescaler  
+  TIMSK1 |= (1 << OCIE1A);  // enable timer compare interrupt
+  interrupts();             // enable all interrupts 
+
+  attachInterrupt(digitalPinToInterrupt(Hall_Pin_A), encoder_isr, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(Hall_Pin_B), encoder_isr, CHANGE);
+}
+
+//=================================================================================
+//=================================================================================
+//==== Adatok kiírása és egyéb ====
+void loop() {
+////==== Szögkalibráció... =====
+//  for(int k = 0; k < 100; k++){
+//    for(int j = 0; j < 5000; j++){
+//      angle1_cal += -atan2(acc1Y - acc1Y_cal, acc1X) * 57.2958;
+//    }
+//    angle1_cal_cal += angle1_cal/5000;
+//    Serial.println(angle1_cal/5000);
+//    angle1_cal = 0;
+//  }
+//  Serial.print(" Es vegul...  ");
+//  Serial.println(angle1_cal_cal/100);
+//  while(1){
+//    
+//  }
+
+  
+}
+
+
+//=================================================================================
+//=================================================================================
+//==== Timer1 interrupt időkritikus müveletekhez ====
+ISR(TIMER1_COMPA_vect){ 
+  interrupts();
+  
+//== Számlálók ==
+  Counter_Tau++;
+  Counter_Measure++;
+  
+//==================
+//==== Vezérlés ==== 
+  if (Counter_Tau > (Tau-1)){ 
+    Counter_Tau = 0;
+    
+    M = 0.0969147 * angle1 + 0.01918103409 * rot1 + 0.030443 * motor_speed;
+    PWM = motor_speed * 13.0 + M * 700.0;    // 150g : motor_speed * 10.0 + M * 650.0;  210g 
+
+    if(PWM>255){
+      PWM = 255;
+    }
+    if(PWM<-255){
+      PWM = -255;
+    }
+
+    if(angle1 > 8 or angle1 < -8){
+      PWM = 0;
+    }
+    
+    if (PWM > 0){
+      digitalWrite(DIR_Pin, 1);
+      analogWrite(PWM_Pin, PWM); 
+    }
+    else{
+      digitalWrite(DIR_Pin, 0);
+      analogWrite(PWM_Pin, -PWM);       
+    }
+  }  
+  
+//==============   
+  recordMPU1Registers();
+//  recordMPU2Registers();
+
+//== Gyro jel szummázása ==
+  D_angle1 += (gyro1 - gyro1_cal) * 0.0000762939;
+//  D_angle2 += (gyro2 - gyro2_cal) * 0.0000762939;
+
+  
+//=====================================
+//==== Mérés / Feldolgozás ============
+  if (Counter_Measure > 3){
+
+//== Hall szenzor adatainak feldolgozása ==
+    motor_speed = 0.0560358 * Ticks; 
+    Ticks = 0;
+    
+//== Gyro szenzor adatok feldolgozása ==      // fokokban
+    angle1 += D_angle1;  
+    //angle2 += D_angle2;
+    angle1a = -atan2(acc1Y - acc1Y_cal, acc1X) * 57.2958 + 0.8; 
+    angle1g += D_angle1;                  
+//    angle2a = -atan2(acc2Y - acc2Y_cal, acc2X) * 57.2958;
+//    angle2g += D_angle2;
+    
+    angle1 = angle1 * gyro_filter + angle1a * acc_filter;     
+    rot1 = (gyro1 - gyro1_cal) / 131.07;          
+//    angle2 = angle2g * gyro_filter + angle2a * acc_filter;   
+//    rot2 = (gyro2 - gyro2_cal) / 131.07; 
+     
+    D_angle1 = 0;
+//    D_angle2 = 0;
+
+  Serial.print(angle1 * 0.0174532925, 4);  // M
+  Serial.print("  ");
+  Serial.print(rot1 * 0.0174532925, 4);   //motor_speed
+  Serial.print("  ");
+  Serial.print(millis());
+//  Serial.print("  ");
+//  Serial.print(PWM);
+  Serial.print("\n");
+
+  Counter_Measure = 0;
+  }
+}
+
+
+//=================================================================================
+//=================================================================================
+
+
+//==== Hall szenzor imulzusaihoz kötött Interrupt Service Routine ====
+void encoder_isr() {
+  static int8_t lookup_table[] = {0,-1,1,0,1,0,0,-1,-1,0,0,1,0,1,-1,0};
+  static uint8_t enc_val = 0;
+  
+  enc_val = enc_val << 2;                             // 2 bittel odébb tolja a hallszenzorok állapotát (HIGH / LOW - 1/0)
+  enc_val = enc_val | ((PIND & 0b00001100) >> 2);     // Az új két 0 helyére beolvassa a pillanatnyi állapotot
+
+  Ticks = Ticks + lookup_table[enc_val & 0b1111];     // A lookup table-ből kinézi, hogy az utsó 2 állapot alapján merre fordult 1 Tick-et
+}
+
+
+//==== Szenzoradatok olvasása ====
+void recordMPU1Registers() {
+  Wire.beginTransmission(0b1101000); //I2C address of the MPU
+  Wire.write(0x43); //Starting register for Gyro Readings
+  Wire.endTransmission();
+  Wire.requestFrom(0b1101000,6); //Request Gyro Registers (43 - 48)
+  while(Wire.available() < 6);
+  Wire.read()<<8|Wire.read(); //Store first two bytes into gyroX
+  Wire.read()<<8|Wire.read(); //Store middle two bytes into gyroY
+  gyro1 = Wire.read()<<8|Wire.read(); //Store last two bytes into gyroZ
+
+  Wire.beginTransmission(0b1101000); //I2C address of the MPU
+  Wire.write(0x3B); //Starting register for Accel Readings
+  Wire.endTransmission();
+  Wire.requestFrom(0b1101000,6); //Request Accel Registers (3B - 40)
+  while(Wire.available() < 6);
+  acc1X = Wire.read()<<8|Wire.read(); //Store first two bytes into accelX
+  acc1Y = Wire.read()<<8|Wire.read(); //Store middle two bytes into accelY
+  Wire.read()<<8|Wire.read(); //Store last two bytes into accelZ
+}
+void recordMPU2Registers() {
+  Wire.beginTransmission(0b1101001); //I2C address of the MPU
+  Wire.write(0x43); //Starting register for Gyro Readings
+  Wire.endTransmission();
+  Wire.requestFrom(0b1101001,6); //Request Gyro Registers (43 - 48)
+  while(Wire.available() < 6);
+  Wire.read()<<8|Wire.read(); //Store first two bytes into gyroX
+  Wire.read()<<8|Wire.read(); //Store middle two bytes into gyroY
+  gyro2 = Wire.read()<<8|Wire.read(); //Store last two bytes into gyroZ
+
+  Wire.beginTransmission(0b1101001); //I2C address of the MPU
+  Wire.write(0x3B); //Starting register for Accel Readings
+  Wire.endTransmission();
+  Wire.requestFrom(0b1101001,6); //Request Accel Registers (3B - 40)
+  while(Wire.available() < 6);
+  acc2X = Wire.read()<<8|Wire.read(); //Store first two bytes into accelX
+  acc2Y = Wire.read()<<8|Wire.read(); //Store middle two bytes into accelY
+  Wire.read()<<8|Wire.read(); //Store last two bytes into accelZ
+}
+
+
+//===============================
+//==== Szenzorok kalibrálása ====
+void Calibrate_MPU1() {
+  //Serial.println("Begin calibration");
+  
+  for (int cal_int = 0; cal_int < 2000; cal_int++){
+    recordMPU1Registers();
+    gyro1_cal_sum += gyro1;
+    acc1Y_cal_sum += acc1Y;   
+  }
+    
+  gyro1_cal = gyro1_cal_sum / 2000.0;
+  acc1Y_cal = 0; //acc1Y_cal_sum / 2000.0;
+
+  //Serial.println("Done calibrating MPU1");
+}
+void Calibrate_MPU2() {
+  //Serial.println("Begin calibration");
+  
+  for (int cal_int = 0; cal_int < 2000; cal_int++){
+    recordMPU2Registers();
+    gyro2_cal_sum += gyro2;
+    acc2Y_cal_sum += acc2Y;
+   
+  }
+    
+  gyro2_cal = gyro2_cal_sum / 2000.0;
+  acc2Y_cal = acc2Y_cal_sum / 2000.0;
+
+  //Serial.println("Done calibrating MPU2");
+}
+
+
+//==============================
+//==== Szenzorok beállítása ====
+void setupMPU1() {
+  Wire.beginTransmission(0b1101000); //This is the I2C address of the MPU (b1101000/b1101001 for AC0 low/high datasheet sec. 9.2)
+  Wire.write(0x6B); //Accessing the register 6B - Power Management (Sec. 4.28)
+  Wire.write(0b00000000); //Setting SLEEP register to 0. (Required; see Note on p. 9)
+  Wire.endTransmission();  
+  Wire.beginTransmission(0b1101000); //I2C address of the MPU
+  Wire.write(0x1B); //Accessing the register 1B - Gyroscope Configuration (Sec. 4.4) 
+  Wire.write(0x00000000); //Setting the gyro to full scale +/- 250deg./s 
+  Wire.endTransmission(); 
+  Wire.beginTransmission(0b1101000); //I2C address of the MPU
+  Wire.write(0x1C); //Accessing the register 1C - Acccelerometer Configuration (Sec. 4.5) 
+  Wire.write(0b00000000); //Setting the accel to +/- 2g
+  Wire.endTransmission(); 
+}
+void setupMPU2() {
+  Wire.beginTransmission(0b1101001); //This is the I2C address of the MPU (b1101000/b1101001 for AC0 low/high datasheet sec. 9.2)
+  Wire.write(0x6B); //Accessing the register 6B - Power Management (Sec. 4.28)
+  Wire.write(0b00000000); //Setting SLEEP register to 0. (Required; see Note on p. 9)
+  Wire.endTransmission();  
+  Wire.beginTransmission(0b1101001); //I2C address of the MPU
+  Wire.write(0x1B); //Accessing the register 1B - Gyroscope Configuration (Sec. 4.4) 
+  Wire.write(0x00000000); //Setting the gyro to full scale +/- 250deg./s 
+  Wire.endTransmission(); 
+  Wire.beginTransmission(0b1101001); //I2C address of the MPU
+  Wire.write(0x1C); //Accessing the register 1C - Acccelerometer Configuration (Sec. 4.5) 
+  Wire.write(0b00000000); //Setting the accel to +/- 2g
+  Wire.endTransmission(); 
+}
+
+
+
+
+
+
+
+
